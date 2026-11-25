@@ -1,6 +1,6 @@
 //! SVG output: one SVG per page. Used for visual checks and as a plain export.
 
-use crate::eddx::{Page, Shape};
+use crate::eddx::{Page, Para, Run, Shape};
 use crate::geom::{Affine, Seg};
 use base64::Engine;
 use std::fmt::Write;
@@ -47,6 +47,54 @@ pub fn dash_array(pattern: u32, width: f64) -> Option<String> {
     }
 }
 
+/// Rough text width in pixels (average glyph = 0.5 em).
+fn est_width(text: &str, size_pt: f64) -> f64 {
+    text.chars().count() as f64 * size_pt * PT_TO_PX * 0.5
+}
+
+/// Paragraphs -> lines of runs: breaks at line breaks, and wraps words to `avail` pixels
+/// unless the paragraph is a single short line (EdrawMax lets those overflow their box).
+pub fn wrap_lines(paras: &[Para], avail: f64) -> Vec<(&'static str, Vec<Run>)> {
+    let mut out: Vec<(&'static str, Vec<Run>)> = Vec::new();
+    for p in paras {
+        let full: f64 = p.runs.iter().map(|r| est_width(&r.text, r.size)).sum();
+        let wrap = full > avail * 1.35;
+        let mut line: Vec<Run> = Vec::new();
+        let mut width = 0.0;
+        for r in &p.runs {
+            let text = r.text.replace("\r\n", "\n").replace(['\r', '\u{2028}'], "\n");
+            for (k, chunk) in text.split('\n').enumerate() {
+                if k > 0 {
+                    out.push((p.align, std::mem::take(&mut line)));
+                    width = 0.0;
+                }
+                if !wrap {
+                    if !chunk.is_empty() {
+                        line.push(Run { text: chunk.to_string(), ..r.clone() });
+                    }
+                    continue;
+                }
+                for word in chunk.split_inclusive(' ') {
+                    let w = est_width(word, r.size);
+                    if width + w > avail && width > 0.0 {
+                        out.push((p.align, std::mem::take(&mut line)));
+                        width = 0.0;
+                    }
+                    match line.last_mut() {
+                        Some(last) if last.size == r.size && last.family == r.family && last.color == r.color && last.bold == r.bold => {
+                            last.text.push_str(word)
+                        }
+                        _ => line.push(Run { text: word.to_string(), ..r.clone() }),
+                    }
+                    width += w;
+                }
+            }
+        }
+        out.push((p.align, line));
+    }
+    out
+}
+
 fn shape(out: &mut String, s: &Shape, parent: &Affine, visible: &dyn Fn(&Shape) -> bool) {
     if !visible(s) {
         return;
@@ -87,22 +135,9 @@ fn shape(out: &mut String, s: &Shape, parent: &Affine, visible: &dyn Fn(&Shape) 
     }
     for t in &s.texts {
         let tm = m.then(&t.local);
-        let lines: Vec<(&str, Vec<&crate::eddx::Run>)> = t
-            .paras
-            .iter()
-            .flat_map(|p| {
-                // split runs at line breaks into separate lines
-                let mut lines: Vec<(&str, Vec<&crate::eddx::Run>)> = vec![(p.align, vec![])];
-                for r in &p.runs {
-                    lines.last_mut().unwrap().1.push(r);
-                    if r.text.ends_with('\n') || r.text.ends_with('\u{2028}') {
-                        lines.push((p.align, vec![]));
-                    }
-                }
-                lines
-            })
-            .collect();
-        let size = |l: &Vec<&crate::eddx::Run>| l.iter().map(|r| r.size).fold(0.0, f64::max).max(6.0) * PT_TO_PX;
+        let avail = (t.w - t.margins[0] - t.margins[2]).max(1.0);
+        let lines = wrap_lines(&t.paras, avail);
+        let size = |l: &Vec<Run>| l.iter().map(|r| r.size).fold(0.0, f64::max).max(6.0) * PT_TO_PX;
         let total: f64 = lines.iter().map(|(_, l)| size(l) * 1.2).sum();
         let [ml, mt, mr, mb] = t.margins;
         let mut y = match t.valign {
@@ -123,14 +158,14 @@ fn shape(out: &mut String, s: &Shape, parent: &Affine, visible: &dyn Fn(&Shape) 
             for r in runs {
                 write!(
                     out,
-                    r#"<tspan font-family="{}" font-size="{}" fill="{}"{}{}{}>{}</tspan>"#,
-                    esc(&r.family),
+                    r#"<tspan font-family="{}, sans-serif" font-size="{}" fill="{}"{}{}{}>{}</tspan>"#,
+                    esc(r.family.trim_start_matches('.')),
                     num(r.size * PT_TO_PX),
                     r.color,
                     if r.bold { r#" font-weight="bold""# } else { "" },
                     if r.italic { r#" font-style="italic""# } else { "" },
                     if r.underline { r#" text-decoration="underline""# } else { "" },
-                    esc(r.text.trim_end_matches(['\n', '\u{2028}']))
+                    esc(r.text.trim_end())
                 )
                 .unwrap();
             }

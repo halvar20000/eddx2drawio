@@ -4,6 +4,9 @@
 pub mod drawio;
 pub mod eddx;
 pub mod geom;
+pub mod inventory;
+pub mod mcp;
+pub mod preview;
 pub mod svg;
 
 use std::path::{Path, PathBuf};

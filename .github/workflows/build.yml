@@ -1,0 +1,91 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # attach the archives to a release on version tags
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: eddx2drawio-windows-x64
+            exe: eddx2drawio.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: eddx2drawio-macos-arm64
+            exe: eddx2drawio
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            name: eddx2drawio-macos-x86_64
+            exe: eddx2drawio
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl  # static: runs on any Linux
+            name: eddx2drawio-linux-x86_64
+            exe: eddx2drawio
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup target add ${{ matrix.target }}
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then sudo apt-get update && sudo apt-get install -y musl-tools; fi
+      - name: Test
+        shell: bash
+        run: cargo test --target ${{ matrix.target }}
+      - name: Lint
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Smoke test (CLI and MCP handshake)
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/${{ matrix.exe }}
+          "$BIN" --version
+          mkdir -p smoke
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+                        '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | "$BIN" mcp --root smoke > mcp.out
+          cat mcp.out
+          grep -q '"convert_eddx"' mcp.out
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p ${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/${{ matrix.exe }} README.md LICENSE ${{ matrix.name }}/
+          if [ "${{ runner.os }}" = "macOS" ]; then codesign --force --sign - ${{ matrix.name }}/${{ matrix.exe }}; fi
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a ${{ matrix.name }}.zip ${{ matrix.name }} > /dev/null
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            ditto -c -k --keepParent ${{ matrix.name }} ${{ matrix.name }}.zip
+          else
+            tar czf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          fi
+          ls -l ${{ matrix.name }}*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}.zip
+            ${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" ${{ matrix.name }}.* --clobber

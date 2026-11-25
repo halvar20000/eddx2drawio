@@ -238,3 +238,124 @@ fn svg_page_renders() {
     roxmltree::Document::parse(&svg).expect("well-formed SVG");
     assert!(!svg.contains("#00ff00"), "shapes on hidden layers are not drawn");
 }
+
+// ---------------------------------------------------------------------------
+// MCP server
+
+fn write_eddx(path: &std::path::Path) {
+    use std::io::Write;
+    let f = std::fs::File::create(path).unwrap();
+    let mut z = zip::ZipWriter::new(f);
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut names: Vec<_> = parts().into_iter().collect();
+    names.sort();
+    for (name, data) in names {
+        z.start_file(name, opts).unwrap();
+        z.write_all(&data).unwrap();
+    }
+    z.finish().unwrap();
+}
+
+struct TempDir(std::path::PathBuf);
+impl TempDir {
+    fn new(tag: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("eddx2drawio-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn call(server: &eddx2drawio::mcp::Server, name: &str, args: serde_json::Value) -> serde_json::Value {
+    let msg = serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": name, "arguments": args}});
+    server.handle(&msg).expect("a request gets a response")["result"].clone()
+}
+
+fn text_of(result: &serde_json::Value) -> String {
+    result["content"].as_array().unwrap().iter().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn mcp_handshake_and_tool_list() {
+    let dir = TempDir::new("hs");
+    let server = eddx2drawio::mcp::Server::new(std::slice::from_ref(&dir.0)).unwrap();
+    let init = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}});
+    let r = server.handle(&init).unwrap();
+    assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
+    assert!(server.handle(&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
+    let tools = server.handle(&serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+    let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for want in ["list_eddx_files", "describe_eddx", "equipment_list", "preview_eddx_page", "convert_eddx"] {
+        assert!(names.contains(&want), "{want} missing from {names:?}");
+    }
+    let unknown = server.handle(&serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "nope"})).unwrap();
+    assert_eq!(unknown["error"]["code"], -32601);
+}
+
+#[test]
+fn mcp_tools_work_inside_the_root() {
+    let dir = TempDir::new("tools");
+    std::fs::create_dir_all(dir.0.join("plant")).unwrap();
+    write_eddx(&dir.0.join("plant/Kolonne.eddx"));
+    let server = eddx2drawio::mcp::Server::new(std::slice::from_ref(&dir.0)).unwrap();
+
+    let list = text_of(&call(&server, "list_eddx_files", serde_json::json!({})));
+    assert!(list.contains("Kolonne.eddx"), "{list}");
+
+    let desc = call(&server, "describe_eddx", serde_json::json!({"path": "plant/Kolonne.eddx"}));
+    assert!(desc.get("isError").is_none(), "{desc}");
+    assert!(text_of(&desc).contains("Kolonne & <1>"));
+
+    let eq = call(&server, "equipment_list", serde_json::json!({"path": "plant/Kolonne.eddx", "output_csv": "lists/eq.csv", "delimiter": ";"}));
+    let t = text_of(&eq);
+    assert!(t.contains("Column") && t.contains("Pump"), "{t}");
+    assert!(dir.0.join("lists/eq.csv").is_file());
+
+    let prev = call(&server, "preview_eddx_page", serde_json::json!({"path": "plant/Kolonne.eddx", "max_px": 300}));
+    let img = &prev["content"][0];
+    assert_eq!(img["type"], "image");
+    let png = base64::engine::general_purpose::STANDARD.decode(img["data"].as_str().unwrap()).unwrap();
+    assert!(png.starts_with(b"\x89PNG"));
+
+    let conv = call(&server, "convert_eddx", serde_json::json!({"path": "plant"}));
+    assert!(text_of(&conv).contains("1 of 1"), "{conv}");
+    assert!(dir.0.join("plant/Kolonne.drawio").is_file());
+}
+
+#[test]
+fn mcp_refuses_paths_outside_the_root() {
+    let outside = TempDir::new("outside");
+    write_eddx(&outside.0.join("secret.eddx"));
+    let dir = TempDir::new("root");
+    write_eddx(&dir.0.join("ok.eddx"));
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside.0, dir.0.join("link")).unwrap();
+    let server = eddx2drawio::mcp::Server::new(std::slice::from_ref(&dir.0)).unwrap();
+
+    let secret = outside.0.join("secret.eddx").display().to_string();
+    let r = call(&server, "describe_eddx", serde_json::json!({"path": secret}));
+    assert_eq!(r["isError"], true);
+    let r = call(&server, "describe_eddx", serde_json::json!({"path": "../eddx2drawio-test-outside-x/secret.eddx"}));
+    assert_eq!(r["isError"], true);
+    #[cfg(unix)]
+    {
+        let r = call(&server, "describe_eddx", serde_json::json!({"path": "link/secret.eddx"}));
+        assert_eq!(r["isError"], true, "a symlink must not lead outside");
+        let r = call(&server, "convert_eddx", serde_json::json!({"path": "ok.eddx", "output": "link/out.drawio"}));
+        assert_eq!(r["isError"], true);
+        assert!(!outside.0.join("out.drawio").exists());
+    }
+    let r = call(&server, "equipment_list", serde_json::json!({"path": "ok.eddx", "output_csv": "../escaped.csv"}));
+    assert_eq!(r["isError"], true);
+    assert!(!dir.0.parent().unwrap().join("escaped.csv").exists());
+}
+
+#[test]
+fn mcp_needs_a_root() {
+    assert!(eddx2drawio::mcp::Server::new(&[]).is_err());
+}
