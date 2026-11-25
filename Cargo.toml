@@ -1,0 +1,22 @@
+[package]
+name = "eddx2drawio"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Convert EdrawMax (.eddx) diagrams to draw.io (.drawio) and SVG"
+repository = "https://github.com/halvar20000/eddx2drawio"
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.20"
+flate2 = "1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

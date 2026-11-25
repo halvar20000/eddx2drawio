@@ -1,0 +1,5 @@
+/target
+# customer drawings and conversion output never go into the repository
+*.eddx
+*.drawio
+*.svg
